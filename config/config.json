@@ -1,0 +1,15 @@
+{
+  "border_color": "#0078D4",
+  "border_thickness": 3,
+  "glow_enabled": true,
+  "glow_radius": 12,
+  "opacity": 0.92,
+  "corner_radius": 0,
+  "refresh_rate_ms": 50,
+  "autostart": false,
+  "excluded_classes": [
+    "Shell_TrayWnd",
+    "Progman",
+    "WorkerW"
+  ]
+}
