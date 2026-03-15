@@ -2,67 +2,102 @@
 """
 FocusFrame — Active Window Border Highlighter for Windows
 =========================================================
-Draws a customizable colored border around whichever window currently has
-keyboard focus. Runs as a system-tray application with no visible window of
-its own.
+Draws a customizable colored border around the currently focused window.
 
-Architecture overview
----------------------
-  Main thread  : tkinter event loop — owns and updates the overlay window.
-  Detector     : background daemon — polls GetForegroundWindow() and schedules
-                 overlay updates via root.after() (thread-safe).
-  TrayIcon     : background daemon — runs the pystray message loop and handles
-                 the "Start with Windows" and "Quit" menu items.
+Key design choices
+------------------
+  Overlay     : Pure Win32 layered window rendered with UpdateLayeredWindow,
+                giving true per-pixel alpha (no chroma-key hack, no black glow).
+  Glow        : Drawn INWARD from the window border, fading to transparent.
+  Tracking    : Detector watches both HWND *and* window position so the overlay
+                follows windows as they are moved or resized.
+  Settings UI : tkinter Toplevel with sliders, opened from the tray menu.
+  Threading   : Detector runs in a daemon thread; tray in another daemon thread;
+                tkinter event loop owns the main thread.
 """
 
 import json
 import os
 import sys
 import ctypes
+import ctypes.wintypes as wt
 import winreg
 import threading
 from pathlib import Path
+import tkinter as tk
+from tkinter import colorchooser
 
 import win32gui
+import win32con
+import win32api
 import pystray
 from PIL import Image, ImageDraw
 
-import tkinter as tk
-
-# ─── Platform guard ───────────────────────────────────────────────────────────
 if sys.platform != "win32":
     sys.exit("FocusFrame only runs on Windows.")
 
-# ─── Win32 extended-style constants ───────────────────────────────────────────
-GWL_EXSTYLE       = -20
-WS_EX_LAYERED     = 0x00080000   # Required for transparency / color-key
-WS_EX_TRANSPARENT = 0x00000020   # Mouse events pass through to windows below
-WS_EX_TOOLWINDOW  = 0x00000080   # Hidden from taskbar and Alt+Tab
-WS_EX_NOACTIVATE  = 0x08000000   # Clicking the overlay does not steal focus
+# ─── Win32 structures needed for UpdateLayeredWindow ──────────────────────────
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize",          ctypes.c_uint32),
+        ("biWidth",         ctypes.c_int32),
+        ("biHeight",        ctypes.c_int32),
+        ("biPlanes",        ctypes.c_uint16),
+        ("biBitCount",      ctypes.c_uint16),
+        ("biCompression",   ctypes.c_uint32),
+        ("biSizeImage",     ctypes.c_uint32),
+        ("biXPelsPerMeter", ctypes.c_int32),
+        ("biYPelsPerMeter", ctypes.c_int32),
+        ("biClrUsed",       ctypes.c_uint32),
+        ("biClrImportant",  ctypes.c_uint32),
+    ]
+
+class _RGBQUAD(ctypes.Structure):
+    _fields_ = [("b", ctypes.c_uint8), ("g", ctypes.c_uint8),
+                ("r", ctypes.c_uint8), ("x", ctypes.c_uint8)]
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", _RGBQUAD * 1)]
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+class _SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+class _BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [
+        ("BlendOp",             ctypes.c_uint8),   # AC_SRC_OVER = 0
+        ("BlendFlags",          ctypes.c_uint8),
+        ("SourceConstantAlpha", ctypes.c_uint8),   # 255 = use per-pixel alpha
+        ("AlphaFormat",         ctypes.c_uint8),   # AC_SRC_ALPHA = 1
+    ]
+
+_ULW_ALPHA    = 2
+_AC_SRC_OVER  = 0
+_AC_SRC_ALPHA = 1
+
+_GWL_EXSTYLE       = -20
+_WS_EX_LAYERED     = 0x00080000
+_WS_EX_TRANSPARENT = 0x00000020
+_WS_EX_TOOLWINDOW  = 0x00000080
+_WS_EX_NOACTIVATE  = 0x08000000
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-class Config:
-    """
-    Thin wrapper around config.json.  Missing keys fall back to DEFAULTS so
-    users can add only the settings they want to override.
-    """
 
+class Config:
     DEFAULTS: dict = {
-        "border_color":     "#0078D4",   # Default: Windows accent blue
-        "border_thickness": 3,           # Pixels
+        "border_color":     "#0078D4",
+        "border_thickness": 2,
         "glow_enabled":     True,
-        "glow_radius":      12,          # Pixels of glow expansion
-        "opacity":          0.92,        # 0.0 – 1.0 (overall overlay opacity)
-        "corner_radius":    0,           # 0 = sharp corners
-        "refresh_rate_ms":  50,          # How often to poll for window changes
-        "autostart":        False,       # Whether to launch at Windows login
-        # Window classes that should never receive an overlay:
-        "excluded_classes": [
-            "Shell_TrayWnd",             # Windows taskbar
-            "Progman",                   # Desktop
-            "WorkerW",                   # Desktop wallpaper worker
-        ],
+        "glow_radius":      8,
+        "opacity":          0.9,
+        "corner_radius":    0,
+        "refresh_rate_ms":  50,
+        "autostart":        False,
+        "excluded_classes": ["Shell_TrayWnd", "Progman", "WorkerW"],
     }
 
     def __init__(self, path: str) -> None:
@@ -75,8 +110,8 @@ class Config:
             try:
                 with open(self.path, "r", encoding="utf-8") as fh:
                     self.data.update(json.load(fh))
-            except (json.JSONDecodeError, IOError) as exc:
-                print(f"[FocusFrame] Config load error ({exc}) — using defaults.")
+            except Exception as exc:
+                print(f"[FocusFrame] Config load error: {exc}")
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,456 +125,563 @@ class Config:
         self.data[key] = value
 
 
-# ─── Overlay Window ───────────────────────────────────────────────────────────
+# ─── Win32 overlay window ─────────────────────────────────────────────────────
+
+def _wndproc(hwnd, msg, wParam, lParam):
+    """Minimal WndProc — everything deferred to DefWindowProc."""
+    return win32gui.DefWindowProc(hwnd, msg, wParam, lParam)
+
+
 class OverlayWindow:
     """
-    A borderless, always-on-top, click-through tkinter window used to draw
-    the highlight border.
+    A borderless, always-on-top, click-through Win32 layered window.
 
-    Transparency strategy
-    ---------------------
-    We configure tkinter with ``-transparentcolor black``: every pixel painted
-    pure black (#000000) becomes fully transparent at the OS level.  We use
-    black as the canvas background, so only the border / glow shapes are
-    visible.  Glow colors are interpolated toward black (never *exactly* black)
-    to simulate a fade-out halo.
+    Rendering strategy
+    ------------------
+    UpdateLayeredWindow() is used instead of GDI paint or tkinter canvas.
+    This gives true per-pixel alpha, so the glow can properly fade to
+    transparent without any black-halo artifact.
+
+    Glow direction
+    --------------
+    The border sits exactly on the target window's edges.
+    Glow rings are drawn INWARD (into the window area), fading from the
+    border color to fully transparent.  The window content below remains
+    visible through the transparent glow pixels.
     """
 
-    _CHROMA_KEY = "black"   # The color that becomes transparent
+    _CLASS = "FocusFrameOverlay"
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        self._hwnd: int = self._create_window()
+        self._visible: bool = False
         self._current_rect: tuple | None = None
-        self._hwnd: int | None = None
 
-        self._enable_dpi_awareness()
-        self._create_window()
+    # ── Window creation ───────────────────────────────────────────────────────
 
-    # ── Setup ──────────────────────────────────────────────────────────────────
+    def _create_window(self) -> int:
+        hinstance = win32api.GetModuleHandle(None)
 
-    def _enable_dpi_awareness(self) -> None:
-        """
-        Per-monitor DPI awareness ensures that GetWindowRect coordinates are
-        accurate on mixed-DPI multi-monitor setups.
-        """
+        wc = win32gui.WNDCLASS()
+        wc.hInstance     = hinstance
+        wc.lpszClassName = self._CLASS
+        wc.lpfnWndProc   = _wndproc
+        wc.style         = 0
+        wc.hCursor       = None
+        wc.hbrBackground = None
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+            win32gui.RegisterClass(wc)
         except Exception:
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
+            pass  # Already registered (e.g. hot-reload)
 
-    def _create_window(self) -> None:
-        self.root = tk.Tk()
-        self.root.title("FocusFrameOverlay")       # Used to find HWND later
-        self.root.overrideredirect(True)            # Remove all window decorations
-        self.root.wm_attributes("-topmost",         True)
-        self.root.wm_attributes("-transparentcolor", self._CHROMA_KEY)
-        self.root.wm_attributes("-alpha",           self.config["opacity"])
-        self.root.configure(bg=self._CHROMA_KEY)
-        self.root.withdraw()                        # Hidden until the first focus event
-
-        self.canvas = tk.Canvas(
-            self.root,
-            bg=self._CHROMA_KEY,
-            highlightthickness=0,
-            cursor="none",
+        ex_style = (
+            win32con.WS_EX_LAYERED    |
+            win32con.WS_EX_TRANSPARENT |
+            win32con.WS_EX_TOPMOST    |
+            win32con.WS_EX_TOOLWINDOW |
+            _WS_EX_NOACTIVATE
         )
-        self.canvas.pack(fill="both", expand=True)
-
-        # The window must be realized (mapped) before we can read its HWND.
-        self.root.update()
-        self._patch_win32_styles()
-
-    def _patch_win32_styles(self) -> None:
-        """
-        Add Win32 extended styles that tkinter does not expose:
-          WS_EX_TRANSPARENT  — passes all mouse/touch input to the window below.
-          WS_EX_TOOLWINDOW   — hides from taskbar and Alt+Tab.
-          WS_EX_NOACTIVATE   — prevents stealing keyboard focus.
-        WS_EX_LAYERED is already set by tkinter when -transparentcolor is used.
-        """
-        hwnd  = self.get_hwnd()
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        ctypes.windll.user32.SetWindowLongW(
-            hwnd, GWL_EXSTYLE,
-            style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        hwnd = win32gui.CreateWindowEx(
+            ex_style, self._CLASS, "",
+            win32con.WS_POPUP,
+            0, 0, 100, 100,
+            None, None, hinstance, None,
         )
+        return hwnd
 
-    # ── Public interface ───────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
-    def get_hwnd(self) -> int:
-        """Return the Win32 HWND for the overlay, caching after first lookup."""
-        if self._hwnd is None:
-            self._hwnd = ctypes.windll.user32.FindWindowW(None, "FocusFrameOverlay")
+    @property
+    def hwnd(self) -> int:
         return self._hwnd
 
     def update_border(self, rect: tuple) -> None:
         """
         Reposition the overlay and redraw the border around *rect*.
-        *rect* is (left, top, right, bottom) in screen coordinates, exactly
-        as returned by win32gui.GetWindowRect().
+        *rect* = (left, top, right, bottom) in screen coordinates.
         """
+        left, top, right, bottom = rect
+        w = right - left
+        h = bottom - top
+
+        if w < 4 or h < 4:
+            self.hide()
+            return
+
+        # Always redraw — position OR size may have changed
         if rect == self._current_rect:
             return
         self._current_rect = rect
 
-        left, top, right, bottom = rect
-        win_w_target = right  - left
-        win_h_target = bottom - top
+        img = self._render(w, h)
+        self._blit(img, left, top, w, h)
 
-        thickness   = self.config["border_thickness"]
-        glow_on     = self.config["glow_enabled"]
-        glow_radius = self.config["glow_radius"] if glow_on else 0
-
-        # Padding = room for glow + border outside the target window edge
-        padding = glow_radius + thickness + 2
-
-        # Size and position the overlay so it encompasses the entire glow area
-        ov_x = left  - padding
-        ov_y = top   - padding
-        ov_w = win_w_target + 2 * padding
-        ov_h = win_h_target + 2 * padding
-
-        self.root.geometry(f"{ov_w}x{ov_h}+{ov_x}+{ov_y}")
-        self.root.deiconify()
-        self.root.lift()
-
-        self._draw(ov_w, ov_h, padding, thickness, glow_radius)
+    def refresh(self) -> None:
+        """Force a redraw with the current config (called after settings change)."""
+        if self._current_rect:
+            saved = self._current_rect
+            self._current_rect = None
+            self.update_border(saved)
 
     def hide(self) -> None:
         self._current_rect = None
-        self.root.withdraw()
+        if self._visible:
+            win32gui.ShowWindow(self._hwnd, win32con.SW_HIDE)
+            self._visible = False
 
-    def mainloop(self) -> None:
-        self.root.mainloop()
+    # ── Rendering (PIL → DIB → UpdateLayeredWindow) ───────────────────────────
 
-    # ── Drawing ────────────────────────────────────────────────────────────────
-
-    def _draw(
-        self,
-        ov_w: int,
-        ov_h: int,
-        padding: int,
-        thickness: int,
-        glow_radius: int,
-    ) -> None:
+    def _render(self, width: int, height: int) -> Image.Image:
         """
-        Clear the canvas and redraw glow + border.
-
-        Coordinate system (relative to the overlay window):
-          (padding, padding)  →  exact left-top corner of the target window
-          (ov_w-padding, ov_h-padding)  →  right-bottom corner
+        Build the RGBA image:
+          1. Glow rings — inward from the border edge, fading to alpha=0.
+          2. Solid border — at the window's outer edge.
         """
-        self.canvas.delete("all")
+        img  = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
 
-        color  = self.config["border_color"]
-        radius = self.config["corner_radius"]
+        col = self.config["border_color"]
+        r   = int(col[1:3], 16)
+        g   = int(col[3:5], 16)
+        b   = int(col[5:7], 16)
 
-        # Inner rectangle aligns with the target window's edges
-        x1, y1 = padding, padding
-        x2, y2 = ov_w - padding, ov_h - padding
+        thickness   = max(1, int(self.config["border_thickness"]))
+        glow_on     = bool(self.config["glow_enabled"])
+        glow_radius = int(self.config["glow_radius"]) if glow_on else 0
+        corner_r    = int(self.config["corner_radius"])
+        opacity     = float(self.config["opacity"])
+        border_a    = int(255 * opacity)
 
-        # ── Glow layers ──────────────────────────────────────────────────────
-        # Draw concentric rings expanding outward from the border.
-        # Each ring is colored by fading the border color toward black;
-        # because black is the chroma-key, the rings gradually "disappear".
+        half = min(width, height) // 2
+
+        # ── Glow (inward, fading to transparent) ──────────────────────────────
+        # Ring index i=0 → at the border (brightest); i=glow_radius-1 → deepest (alpha≈0)
         if glow_radius > 0:
-            for i in range(glow_radius, 0, -1):
-                fade_factor = i / glow_radius          # 1 = far out (dark), 0 = near border (bright)
-                glow_color  = self._fade_to_black(color, fade_factor)
-                self._draw_rect(
-                    x1 - i, y1 - i, x2 + i, y2 + i,
-                    glow_color, 1, max(0, radius + i),
-                )
+            for i in range(glow_radius):
+                fade  = i / glow_radius            # 0.0=bright → 1.0=transparent
+                alpha = int(border_a * (1.0 - fade) * 0.75)
+                if alpha < 2:
+                    continue
+                offset = thickness + i             # Move inward past the border
+                if offset >= half:
+                    break
+                self._rect(draw,
+                           offset, offset, width - offset - 1, height - offset - 1,
+                           (r, g, b, alpha), 1,
+                           max(0, corner_r - offset))
 
-        # ── Border rings ─────────────────────────────────────────────────────
-        # Draw the solid border as multiple 1-pixel-wide concentric rings
-        # expanding outward from the window edge.
+        # ── Solid border at window edges ───────────────────────────────────────
         for i in range(thickness):
-            self._draw_rect(
-                x1 - i, y1 - i, x2 + i, y2 + i,
-                color, 1, max(0, radius + i),
-            )
+            if i >= half:
+                break
+            self._rect(draw,
+                       i, i, width - i - 1, height - i - 1,
+                       (r, g, b, border_a), 1,
+                       max(0, corner_r - i))
 
-    def _draw_rect(
-        self,
-        x1: float, y1: float, x2: float, y2: float,
-        color: str, width: int, radius: int,
-    ) -> None:
-        """Draw a (rounded) rectangle outline on the canvas."""
+        return img
+
+    @staticmethod
+    def _rect(draw, x1, y1, x2, y2, color, lw, radius=0):
+        """Draw a (optionally rounded) rectangle outline."""
         if radius > 0 and 2 * radius < min(x2 - x1, y2 - y1):
             r = radius
-            # Four corner arcs
-            corners = [
-                (x1,       y1,       90),   # Top-left
-                (x2 - 2*r, y1,        0),   # Top-right
-                (x2 - 2*r, y2 - 2*r, 270), # Bottom-right
-                (x1,       y2 - 2*r, 180), # Bottom-left
-            ]
-            for cx, cy, start in corners:
-                self.canvas.create_arc(
-                    cx, cy, cx + 2*r, cy + 2*r,
-                    start=start, extent=90,
-                    outline=color, style="arc", width=width,
-                )
-            # Four straight edges connecting the arcs
-            self.canvas.create_line(x1 + r, y1, x2 - r, y1, fill=color, width=width)
-            self.canvas.create_line(x2, y1 + r, x2, y2 - r, fill=color, width=width)
-            self.canvas.create_line(x1 + r, y2, x2 - r, y2, fill=color, width=width)
-            self.canvas.create_line(x1, y1 + r, x1, y2 - r, fill=color, width=width)
+            draw.arc([x1,       y1,       x1+2*r, y1+2*r], 180, 270, fill=color, width=lw)
+            draw.arc([x2-2*r,   y1,       x2,     y1+2*r], 270, 360, fill=color, width=lw)
+            draw.arc([x2-2*r,   y2-2*r,   x2,     y2    ], 0,   90,  fill=color, width=lw)
+            draw.arc([x1,       y2-2*r,   x1+2*r, y2    ], 90,  180, fill=color, width=lw)
+            draw.line([x1+r, y1,  x2-r, y1 ], fill=color, width=lw)
+            draw.line([x2,   y1+r, x2,  y2-r], fill=color, width=lw)
+            draw.line([x1+r, y2,  x2-r, y2 ], fill=color, width=lw)
+            draw.line([x1,   y1+r, x1,  y2-r], fill=color, width=lw)
         else:
-            self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=width)
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=lw)
 
-    def _fade_to_black(self, color: str, factor: float) -> str:
+    def _blit(self, img: Image.Image, dst_x: int, dst_y: int, w: int, h: int) -> None:
         """
-        Interpolate *color* toward black by *factor* (0.0 = original color,
-        1.0 = near-black).  The result is never exactly #000000 so the chroma-
-        key never accidentally swallows visible glow pixels.
+        Push the RGBA image to the layered window via UpdateLayeredWindow.
+        This replaces the entire window content (position + pixels) atomically.
         """
-        r = int(color[1:3], 16)
-        g = int(color[3:5], 16)
-        b = int(color[5:7], 16)
-        r = max(1, int(r * (1.0 - factor)))
-        g = max(1, int(g * (1.0 - factor)))
-        b = max(1, int(b * (1.0 - factor)))
-        return f"#{r:02x}{g:02x}{b:02x}"
+        # PIL stores RGBA; Windows DIB expects BGRA
+        r_ch, g_ch, b_ch, a_ch = img.split()
+        bgra_img = Image.merge("RGBA", (b_ch, g_ch, r_ch, a_ch))
+        raw      = bgra_img.tobytes()
+
+        hdc_screen = ctypes.windll.user32.GetDC(None)
+        hdc_mem    = ctypes.windll.gdi32.CreateCompatibleDC(hdc_screen)
+
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader.biSize      = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth     = w
+        bmi.bmiHeader.biHeight    = -h   # negative → top-down DIB
+        bmi.bmiHeader.biPlanes    = 1
+        bmi.bmiHeader.biBitCount  = 32
+        bmi.bmiHeader.biCompression = 0  # BI_RGB
+
+        pbits = ctypes.c_void_p()
+        hbm   = ctypes.windll.gdi32.CreateDIBSection(
+            hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(pbits), None, 0
+        )
+        ctypes.memmove(pbits, raw, len(raw))
+        old_bm = ctypes.windll.gdi32.SelectObject(hdc_mem, hbm)
+
+        pt_dst = _POINT(dst_x, dst_y)
+        pt_src = _POINT(0, 0)
+        sz     = _SIZE(w, h)
+        bf     = _BLENDFUNCTION(_AC_SRC_OVER, 0, 255, _AC_SRC_ALPHA)
+
+        # Show the window (no-op if already visible, never steals focus)
+        if not self._visible:
+            win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWNOACTIVATE)
+            self._visible = True
+
+        ctypes.windll.user32.UpdateLayeredWindow(
+            self._hwnd,
+            hdc_screen,
+            ctypes.byref(pt_dst),
+            ctypes.byref(sz),
+            hdc_mem,
+            ctypes.byref(pt_src),
+            0,
+            ctypes.byref(bf),
+            _ULW_ALPHA,
+        )
+
+        # Clean up GDI objects
+        ctypes.windll.gdi32.SelectObject(hdc_mem, old_bm)
+        ctypes.windll.gdi32.DeleteObject(hbm)
+        ctypes.windll.gdi32.DeleteDC(hdc_mem)
+        ctypes.windll.user32.ReleaseDC(None, hdc_screen)
 
 
 # ─── Focus Detector ───────────────────────────────────────────────────────────
+
 class FocusDetector:
     """
-    Polls win32gui.GetForegroundWindow() in a background thread at the
-    configured refresh rate.  When the active window changes, it schedules an
-    overlay update on the tkinter main thread using root.after(0, ...).
+    Polls GetForegroundWindow() and GetWindowRect() in a background thread.
 
-    Using root.after() is the only thread-safe way to call tkinter from outside
-    the main thread.
+    The overlay is updated whenever:
+      - The focused window changes (different HWND), OR
+      - The focused window is moved / resized (same HWND, different rect).
+
+    Both conditions are checked every refresh_rate_ms milliseconds, which is
+    what makes the overlay follow windows smoothly as they are dragged.
     """
 
-    # Window classes that are always excluded, regardless of config
     _ALWAYS_EXCLUDE = {"Shell_TrayWnd", "Progman", "WorkerW"}
 
-    def __init__(
-        self,
-        config: Config,
-        overlay: OverlayWindow,
-        stop_event: threading.Event,
-    ) -> None:
-        self.config      = config
-        self.overlay     = overlay
-        self.stop_event  = stop_event
-        self._last_hwnd: int | None = None
-        self._overlay_hwnd: int | None = None   # Filled in after overlay is visible
+    def __init__(self, config: Config, overlay: OverlayWindow,
+                 stop_event: threading.Event) -> None:
+        self.config     = config
+        self.overlay    = overlay
+        self.stop_event = stop_event
+        self._last_hwnd: int | None   = None
+        self._last_rect: tuple | None = None
 
     def run(self) -> None:
-        """Entry point for the detector daemon thread."""
-        interval = self.config["refresh_rate_ms"] / 1000.0
+        """Daemon thread entry point."""
         while not self.stop_event.is_set():
             try:
                 self._tick()
             except Exception as exc:
-                print(f"[FocusFrame] Detector error: {exc}")
-            self.stop_event.wait(interval)
+                print(f"[FocusFrame] Detector: {exc}")
+            self.stop_event.wait(self.config["refresh_rate_ms"] / 1000.0)
 
     def _tick(self) -> None:
-        """One polling iteration: check if foreground window has changed."""
         hwnd = win32gui.GetForegroundWindow()
 
-        # Skip if same window as last frame — no work to do
-        if hwnd == self._last_hwnd:
-            return
-        self._last_hwnd = hwnd
-
         if self._should_skip(hwnd):
-            # Schedule hide() on the tkinter thread
-            self.overlay.root.after(0, self.overlay.hide)
+            if self._last_hwnd is not None:
+                self._last_hwnd = None
+                self._last_rect = None
+                self.overlay.hide()
             return
 
         try:
-            # GetWindowRect returns (left, top, right, bottom) in screen coords
             rect = win32gui.GetWindowRect(hwnd)
-            self.overlay.root.after(0, lambda r=rect: self.overlay.update_border(r))
         except Exception:
-            self.overlay.root.after(0, self.overlay.hide)
+            self.overlay.hide()
+            return
+
+        # Skip if nothing changed — avoids unnecessary redraws
+        if hwnd == self._last_hwnd and rect == self._last_rect:
+            return
+
+        self._last_hwnd = hwnd
+        self._last_rect = rect
+        self.overlay.update_border(rect)
 
     def _should_skip(self, hwnd: int) -> bool:
-        """Return True if this window should not receive a border overlay."""
         if not hwnd:
             return True
-
-        # Minimized (iconic) windows have no meaningful visible area
-        if win32gui.IsIconic(hwnd):
+        if win32gui.IsIconic(hwnd):        # Minimised window
             return True
-
-        # Never highlight our own overlay window
-        if self._overlay_hwnd and hwnd == self._overlay_hwnd:
+        if hwnd == self.overlay.hwnd:      # Our own overlay
             return True
-
         try:
-            class_name = win32gui.GetClassName(hwnd)
+            cls = win32gui.GetClassName(hwnd)
         except Exception:
             return True
+        user_excl = set(self.config["excluded_classes"])
+        return cls in self._ALWAYS_EXCLUDE or cls in user_excl
 
-        user_excluded = set(self.config["excluded_classes"])
-        return class_name in self._ALWAYS_EXCLUDE or class_name in user_excluded
+
+# ─── Settings Window ──────────────────────────────────────────────────────────
+
+class SettingsWindow:
+    """
+    A simple settings panel with sliders for all visual parameters.
+    Changes are applied live to the overlay as sliders are moved.
+    Opened from the tray right-click menu.
+    """
+
+    def __init__(self, config: Config, overlay: OverlayWindow,
+                 root: tk.Tk) -> None:
+        self.config  = config
+        self.overlay = overlay
+        self.root    = root
+        self._win: tk.Toplevel | None = None
+
+    def show(self) -> None:
+        if self._win and self._win.winfo_exists():
+            self._win.lift()
+            self._win.focus_force()
+            return
+        self._build()
+
+    def _build(self) -> None:
+        win = tk.Toplevel(self.root)
+        self._win = win
+        win.title("FocusFrame — Settings")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.configure(padx=24, pady=16)
+
+        frame = tk.Frame(win)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        row = 0
+
+        # ── Border color ──────────────────────────────────────────────────────
+        self._color = tk.StringVar(value=self.config["border_color"])
+        tk.Label(frame, text="Border color", anchor="w").grid(
+            row=row, column=0, sticky="w", padx=8, pady=6)
+        self._color_btn = tk.Button(
+            frame, bg=self._color.get(), width=8, relief="solid",
+            command=self._pick_color,
+        )
+        self._color_btn.grid(row=row, column=1, sticky="w", padx=8, pady=6)
+        row += 1
+
+        # ── Sliders ───────────────────────────────────────────────────────────
+        self._thickness = tk.IntVar(value=self.config["border_thickness"])
+        row = self._slider(frame, row, "Border thickness",
+                           self._thickness, 1, 10)
+
+        self._glow_on = tk.BooleanVar(value=self.config["glow_enabled"])
+        tk.Label(frame, text="Glow", anchor="w").grid(
+            row=row, column=0, sticky="w", padx=8, pady=6)
+        tk.Checkbutton(frame, variable=self._glow_on,
+                       command=self._apply).grid(
+            row=row, column=1, sticky="w", padx=8, pady=6)
+        row += 1
+
+        self._glow_r = tk.IntVar(value=self.config["glow_radius"])
+        row = self._slider(frame, row, "Glow radius", self._glow_r, 0, 40)
+
+        self._opacity = tk.DoubleVar(value=self.config["opacity"])
+        row = self._slider(frame, row, "Opacity",
+                           self._opacity, 0.1, 1.0, res=0.05)
+
+        self._corner = tk.IntVar(value=self.config["corner_radius"])
+        row = self._slider(frame, row, "Corner radius", self._corner, 0, 30)
+
+        self._refresh = tk.IntVar(value=self.config["refresh_rate_ms"])
+        row = self._slider(frame, row, "Refresh rate (ms)",
+                           self._refresh, 10, 200)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn = tk.Frame(frame)
+        btn.grid(row=row, column=0, columnspan=2, pady=(14, 0))
+        tk.Button(btn, text="Save & close", width=14,
+                  command=self._save).pack(side="left", padx=4)
+        tk.Button(btn, text="Close", width=10,
+                  command=win.destroy).pack(side="left", padx=4)
+
+        # Center on screen
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        ww, wh = win.winfo_reqwidth(),    win.winfo_reqheight()
+        win.geometry(f"+{(sw-ww)//2}+{(sh-wh)//2}")
+
+    def _slider(self, frame, row, label, var, lo, hi, res=1):
+        tk.Label(frame, text=label, anchor="w").grid(
+            row=row, column=0, sticky="w", padx=8, pady=4)
+        tk.Scale(frame, variable=var, from_=lo, to=hi, orient="horizontal",
+                 resolution=res, showvalue=True, length=200,
+                 command=lambda _: self._apply()).grid(
+            row=row, column=1, sticky="ew", padx=8, pady=4)
+        return row + 1
+
+    def _pick_color(self) -> None:
+        result = colorchooser.askcolor(
+            color=self._color.get(),
+            title="Choose border color",
+            parent=self._win,
+        )
+        if result and result[1]:
+            self._color.set(result[1])
+            self._color_btn.configure(bg=result[1])
+            self._apply()
+
+    def _apply(self) -> None:
+        """Push current UI values into config and refresh the overlay live."""
+        self.config["border_color"]     = self._color.get()
+        self.config["border_thickness"] = self._thickness.get()
+        self.config["glow_enabled"]     = self._glow_on.get()
+        self.config["glow_radius"]      = self._glow_r.get()
+        self.config["opacity"]          = round(self._opacity.get(), 2)
+        self.config["corner_radius"]    = self._corner.get()
+        self.config["refresh_rate_ms"]  = self._refresh.get()
+        self.overlay.refresh()
+
+    def _save(self) -> None:
+        self._apply()
+        self.config.save()
+        if self._win:
+            self._win.destroy()
 
 
 # ─── Tray Icon ────────────────────────────────────────────────────────────────
+
 class TrayIcon:
-    """
-    System-tray icon with a minimal context menu:
-      • Start with Windows  (toggle, persisted to config + registry)
-      • Quit
-    """
+    """System-tray icon with Settings, Start with Windows, and Quit."""
 
-    APP_NAME = "FocusFrame"
+    APP = "FocusFrame"
 
-    def __init__(
-        self,
-        config: Config,
-        overlay: OverlayWindow,
-        stop_event: threading.Event,
-    ) -> None:
+    def __init__(self, config: Config, overlay: OverlayWindow,
+                 settings: SettingsWindow, stop_event: threading.Event,
+                 root: tk.Tk) -> None:
         self.config     = config
         self.overlay    = overlay
+        self.settings   = settings
         self.stop_event = stop_event
-        self._icon: pystray.Icon | None = None
+        self.root       = root
 
-    # ── Icon image ─────────────────────────────────────────────────────────────
-
-    def _make_image(self, size: int = 64) -> Image.Image:
-        """Generate a small frame icon using the configured border color."""
+    def _icon_image(self, size: int = 64) -> Image.Image:
         img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-
-        color = self.config["border_color"]
-        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
-
-        margin     = size // 6
-        line_width = max(3, size // 10)
-        draw.rectangle(
-            [margin, margin, size - margin, size - margin],
-            outline=(r, g, b, 255),
-            width=line_width,
-        )
+        c    = self.config["border_color"]
+        r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+        m, lw = size // 6, max(3, size // 10)
+        draw.rectangle([m, m, size - m, size - m], outline=(r, g, b, 255), width=lw)
         return img
 
-    # ── Autostart (Windows registry) ───────────────────────────────────────────
+    # ── Autostart ─────────────────────────────────────────────────────────────
 
-    def _build_launch_command(self) -> str:
-        """
-        Return the command string that should be stored in the registry.
-        Handles both the compiled-exe case (PyInstaller) and plain-script case.
-        """
+    def _launch_cmd(self) -> str:
         if getattr(sys, "frozen", False):
-            # Running as a standalone .exe built by PyInstaller
             return f'"{sys.executable}"'
-        # Running as a plain Python script
-        script = os.path.abspath(sys.argv[0])
-        return f'"{sys.executable}" "{script}"'
+        return f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
 
-    def _apply_autostart(self, enable: bool) -> None:
-        """Write or remove the registry Run entry for FocusFrame."""
+    def _set_autostart(self, enable: bool) -> None:
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         try:
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
-            )
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                 winreg.KEY_SET_VALUE)
             if enable:
-                winreg.SetValueEx(
-                    key, self.APP_NAME, 0, winreg.REG_SZ,
-                    self._build_launch_command(),
-                )
+                winreg.SetValueEx(key, self.APP, 0, winreg.REG_SZ,
+                                  self._launch_cmd())
             else:
                 try:
-                    winreg.DeleteValue(key, self.APP_NAME)
+                    winreg.DeleteValue(key, self.APP)
                 except FileNotFoundError:
                     pass
             winreg.CloseKey(key)
         except Exception as exc:
-            print(f"[FocusFrame] Autostart registry error: {exc}")
+            print(f"[FocusFrame] Autostart: {exc}")
 
     # ── Menu callbacks ─────────────────────────────────────────────────────────
 
-    def _on_toggle_autostart(self, icon: pystray.Icon, item) -> None:
-        new_value = not self.config["autostart"]
-        self.config["autostart"] = new_value
-        self.config.save()
-        self._apply_autostart(new_value)
+    def _on_settings(self, icon, item) -> None:
+        # Must run on the main (tkinter) thread
+        self.root.after(0, self.settings.show)
 
-    def _on_quit(self, icon: pystray.Icon, item) -> None:
+    def _on_autostart(self, icon, item) -> None:
+        new = not self.config["autostart"]
+        self.config["autostart"] = new
+        self.config.save()
+        self._set_autostart(new)
+
+    def _on_quit(self, icon, item) -> None:
         self.stop_event.set()
         icon.stop()
-        # Ask tkinter to exit its event loop from the main thread
-        self.overlay.root.after(0, self.overlay.root.quit)
+        self.root.after(0, self.root.quit)
 
     # ── Entry point ────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Start the pystray icon.  Blocks until icon.stop() is called."""
         menu = pystray.Menu(
-            pystray.MenuItem(self.APP_NAME, None, enabled=False),
+            pystray.MenuItem(self.APP, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Settings",          self._on_settings),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Start with Windows",
-                self._on_toggle_autostart,
+                "Start with Windows", self._on_autostart,
                 checked=lambda _: bool(self.config["autostart"]),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._on_quit),
         )
-        self._icon = pystray.Icon(
-            self.APP_NAME,
-            self._make_image(),
-            self.APP_NAME,
-            menu,
-        )
-        self._icon.run()
+        pystray.Icon(self.APP, self._icon_image(), self.APP, menu).run()
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 def _locate_config() -> Path:
-    """
-    Return the path to config/config.json relative to the project root.
-
-    When frozen by PyInstaller (sys.frozen == True), sys.executable is the
-    .exe file; the config folder is expected next to it.
-    When running as a plain script, __file__ is src/focusframe.py, so the
-    project root is one level up.
-    """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent / "config" / "config.json"
     return Path(__file__).resolve().parent.parent / "config" / "config.json"
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
-
 def main() -> None:
+    # Enable per-monitor DPI awareness before any window is created
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
     config     = Config(str(_locate_config()))
     stop_event = threading.Event()
-    overlay    = OverlayWindow(config)
-    detector   = FocusDetector(config, overlay, stop_event)
-    tray       = TrayIcon(config, overlay, stop_event)
 
-    # Let the detector know which HWND is ours so it never highlights itself
-    overlay.root.update()
-    detector._overlay_hwnd = overlay.get_hwnd()
+    # Overlay is a pure Win32 window (no tkinter involved in its rendering)
+    overlay = OverlayWindow(config)
 
-    # Detector runs in a daemon thread — dies automatically when main exits
-    threading.Thread(
-        target=detector.run, daemon=True, name="FocusDetector"
-    ).start()
+    # Hidden tkinter root — only used for the Settings Toplevel + message pump
+    root = tk.Tk()
+    root.withdraw()
 
-    # Tray icon also runs in a daemon thread
-    threading.Thread(
-        target=tray.run, daemon=True, name="TrayIcon"
-    ).start()
+    settings = SettingsWindow(config, overlay, root)
+    tray     = TrayIcon(config, overlay, settings, stop_event, root)
+    detector = FocusDetector(config, overlay, stop_event)
 
-    # tkinter's event loop must run on the main thread
-    overlay.mainloop()
+    # Pump Win32 messages for the overlay window from the tkinter event loop
+    def _pump():
+        win32gui.PumpWaitingMessages()
+        if not stop_event.is_set():
+            root.after(32, _pump)
+
+    root.after(32, _pump)
+
+    threading.Thread(target=detector.run, daemon=True, name="Detector").start()
+    threading.Thread(target=tray.run,     daemon=True, name="TrayIcon").start()
+
+    root.mainloop()
 
 
 if __name__ == "__main__":
