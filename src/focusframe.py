@@ -168,8 +168,8 @@ class OverlayWindow:
         wc.lpszClassName = self._CLASS
         wc.lpfnWndProc   = _wndproc
         wc.style         = 0
-        wc.hCursor       = None
-        wc.hbrBackground = None
+        wc.hCursor       = 0
+        wc.hbrBackground = 0
         try:
             win32gui.RegisterClass(wc)
         except Exception:
