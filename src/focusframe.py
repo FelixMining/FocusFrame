@@ -95,6 +95,7 @@ class Config:
         "glow_radius":      8,
         "opacity":          0.9,
         "corner_radius":    0,
+        "border_inset":     0,
         "refresh_rate_ms":  50,
         "autostart":        False,
         "excluded_classes": ["Shell_TrayWnd", "Progman", "WorkerW"],
@@ -252,18 +253,18 @@ class OverlayWindow:
         corner_r    = int(self.config["corner_radius"])
         opacity     = float(self.config["opacity"])
         border_a    = int(255 * opacity)
+        inset       = max(0, int(self.config["border_inset"]))
 
         half = min(width, height) // 2
 
         # ── Glow (inward, fading to transparent) ──────────────────────────────
-        # Ring index i=0 → at the border (brightest); i=glow_radius-1 → deepest (alpha≈0)
         if glow_radius > 0:
             for i in range(glow_radius):
-                fade  = i / glow_radius            # 0.0=bright → 1.0=transparent
+                fade  = i / glow_radius
                 alpha = int(border_a * (1.0 - fade) * 0.75)
                 if alpha < 2:
                     continue
-                offset = thickness + i             # Move inward past the border
+                offset = inset + thickness + i
                 if offset >= half:
                     break
                 self._rect(draw,
@@ -271,14 +272,15 @@ class OverlayWindow:
                            (r, g, b, alpha), 1,
                            max(0, corner_r - offset))
 
-        # ── Solid border at window edges ───────────────────────────────────────
+        # ── Solid border ─────────────────────────────────────────────────────
         for i in range(thickness):
-            if i >= half:
+            offset = inset + i
+            if offset >= half:
                 break
             self._rect(draw,
-                       i, i, width - i - 1, height - i - 1,
+                       offset, offset, width - offset - 1, height - offset - 1,
                        (r, g, b, border_a), 1,
-                       max(0, corner_r - i))
+                       max(0, corner_r - offset))
 
         return img
 
@@ -533,9 +535,12 @@ class SettingsWindow:
         self._corner = tk.IntVar(value=self.config["corner_radius"])
         row = self._slider(frame, row, "Corner radius", self._corner, 0, 30)
 
+        self._inset = tk.IntVar(value=self.config["border_inset"])
+        row = self._slider(frame, row, "Border inset", self._inset, 0, 30)
+
         self._refresh = tk.IntVar(value=self.config["refresh_rate_ms"])
         row = self._slider(frame, row, "Refresh rate (ms)",
-                           self._refresh, 10, 200)
+                           self._refresh, 1, 200)
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn = tk.Frame(frame)
@@ -585,6 +590,7 @@ class SettingsWindow:
         self.config["glow_radius"]      = self._glow_r.get()
         self.config["opacity"]          = round(self._opacity.get(), 2)
         self.config["corner_radius"]    = self._corner.get()
+        self.config["border_inset"]     = self._inset.get()
         self.config["refresh_rate_ms"]  = self._refresh.get()
         self.overlay.refresh()
 
