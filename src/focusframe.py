@@ -436,6 +436,21 @@ class SettingsWindow:
     Opened from the tray right-click menu.
     """
 
+    PRESETS = [
+        ("Default Blue",  "#0078D4"), ("Red Alert",    "#FF3B30"),
+        ("Green Focus",   "#30D158"), ("White Minimal", "#FFFFFF"),
+        ("Amber Warm",    "#FF9F0A"), ("Violet Dream",  "#A78BFA"),
+        ("Hot Pink",      "#FF375F"), ("Cyan Ice",      "#64D2FF"),
+        ("Blue-Violet",   "#7C6CDB"), ("Yellow Neon",   "#FFD60A"),
+        ("Sunset",        "#FF6B20"), ("Lime",          "#34C759"),
+        ("Mint Ocean",    "#4AE4A0"), ("Purple Haze",   "#BF5AF2"),
+        ("Crimson",       "#FF2D55"), ("Gold Rush",     "#FFBA0A"),
+        ("Sky Blue",      "#5AC8FA"), ("Coral",         "#FF6482"),
+        ("Gradient Fade", "#D080CD"), ("Emerald",       "#48DC7D"),
+        ("iOS Blue",      "#007AFF"), ("Berry Blast",   "#DF44A4"),
+        ("Steel Gray",    "#8E8E93"), ("Soft White",    "#E0E0E0"),
+    ]
+
     def __init__(self, config: Config, overlay: OverlayWindow,
                  root: tk.Tk) -> None:
         self.config  = config
@@ -473,6 +488,26 @@ class SettingsWindow:
             command=self._pick_color,
         )
         self._color_btn.grid(row=row, column=1, sticky="w", padx=8, pady=6)
+        row += 1
+
+        # ── Color presets ────────────────────────────────────────────────────
+        tk.Label(frame, text="Presets", anchor="w").grid(
+            row=row, column=0, sticky="nw", padx=8, pady=6)
+        preset_frame = tk.Frame(frame)
+        preset_frame.grid(row=row, column=1, sticky="w", padx=8, pady=6)
+        cols = 6
+        for idx, (name, hex_color) in enumerate(self.PRESETS):
+            r_idx, c_idx = divmod(idx, cols)
+            btn = tk.Button(
+                preset_frame, bg=hex_color, width=2, height=1,
+                relief="solid", borderwidth=1,
+                command=lambda c=hex_color: self._set_preset(c),
+            )
+            btn.grid(row=r_idx, column=c_idx, padx=1, pady=1)
+            btn.bind("<Enter>",
+                     lambda e, n=name: self._win.title(f"FocusFrame — {n}"))
+            btn.bind("<Leave>",
+                     lambda e: self._win.title("FocusFrame — Settings"))
         row += 1
 
         # ── Sliders ───────────────────────────────────────────────────────────
@@ -524,6 +559,12 @@ class SettingsWindow:
                  command=lambda _: self._apply()).grid(
             row=row, column=1, sticky="ew", padx=8, pady=4)
         return row + 1
+
+    def _set_preset(self, hex_color: str) -> None:
+        """Apply a preset color and update the UI."""
+        self._color.set(hex_color)
+        self._color_btn.configure(bg=hex_color)
+        self._apply()
 
     def _pick_color(self) -> None:
         result = colorchooser.askcolor(
