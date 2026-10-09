@@ -6,23 +6,39 @@ Draws a customizable colored border around the currently focused window.
 
 Key design choices
 ------------------
-  Overlay     : Pure Win32 layered window rendered with UpdateLayeredWindow,
-                giving true per-pixel alpha (no chroma-key hack, no black glow).
-  Glow        : Drawn INWARD from the window border, fading to transparent.
-  Tracking    : Detector watches both HWND *and* window position so the overlay
-                follows windows as they are moved or resized.
-  Settings UI : tkinter Toplevel with sliders, opened from the tray menu.
-  Threading   : Detector runs in a daemon thread; tray in another daemon thread;
-                tkinter event loop owns the main thread.
+  Overlay      : Pure Win32 layered window rendered with UpdateLayeredWindow,
+                 giving true per-pixel alpha (no chroma-key hack, no black glow).
+  Glow         : Drawn INWARD from the window border, fading to transparent.
+  Tracking     : Detector watches both HWND *and* window position so the overlay
+                 follows windows as they are moved or resized.
+  Self-healing : Windows occasionally places a shell-activated window (e.g. a
+                 file opened from Explorer) ABOVE every topmost window without
+                 clearing their WS_EX_TOPMOST bit.  From then on every activated
+                 window stacks above the overlay and the border "disappears".
+                 The detector therefore re-asserts HWND_TOPMOST whenever the
+                 overlay is found below a normal window, recreates the overlay
+                 if it is destroyed, and forces a redraw after display, power
+                 and session (lock/unlock) changes.
+  Settings UI  : tkinter Toplevel with sliders, opened from the tray menu.
+  Threading    : The overlay window is created, drawn and pumped on the detector
+                 thread (its owner), so no cross-thread window call can stall.
+                 Tray runs in another daemon thread; the tkinter event loop owns
+                 the main thread and only talks to the overlay through flags.
+  Logging      : focusframe.log (rotating) next to the project / executable, or
+                 in %LOCALAPPDATA%\\FocusFrame if that location is not writable.
 """
 
 import json
+import logging
+import logging.handlers
 import os
 import sys
 import ctypes
 import ctypes.wintypes as wt
-import winreg
+import tempfile
 import threading
+import time
+import winreg
 from pathlib import Path
 import tkinter as tk
 from tkinter import colorchooser
@@ -31,10 +47,12 @@ import win32gui
 import win32con
 import win32api
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 if sys.platform != "win32":
     sys.exit("FocusFrame only runs on Windows.")
+
+log = logging.getLogger("FocusFrame")
 
 # ─── Win32 structures needed for UpdateLayeredWindow ──────────────────────────
 
@@ -78,11 +96,50 @@ _ULW_ALPHA    = 2
 _AC_SRC_OVER  = 0
 _AC_SRC_ALPHA = 1
 
-_GWL_EXSTYLE       = -20
-_WS_EX_LAYERED     = 0x00080000
+_WS_EX_TOPMOST     = 0x00000008
 _WS_EX_TRANSPARENT = 0x00000020
 _WS_EX_TOOLWINDOW  = 0x00000080
+_WS_EX_LAYERED     = 0x00080000
 _WS_EX_NOACTIVATE  = 0x08000000
+
+_WM_DESTROY           = 0x0002
+_WM_CLOSE             = 0x0010
+_WM_SETTINGCHANGE     = 0x001A
+_WM_DISPLAYCHANGE     = 0x007E
+_WM_POWERBROADCAST    = 0x0218
+_WM_WTSSESSION_CHANGE = 0x02B1
+_WM_DPICHANGED        = 0x02E0
+_DWMWA_CLOAKED        = 14
+
+# Explicit prototypes: with plain ctypes.windll every handle is truncated to a
+# 32-bit int, which happens to work on Windows today but is not guaranteed.
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_gdi32  = ctypes.WinDLL("gdi32",  use_last_error=True)
+_dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+
+_user32.GetDC.argtypes,     _user32.GetDC.restype     = [wt.HWND], wt.HDC
+_user32.ReleaseDC.argtypes, _user32.ReleaseDC.restype = [wt.HWND, wt.HDC], ctypes.c_int
+_user32.UpdateLayeredWindow.argtypes = [
+    wt.HWND, wt.HDC, ctypes.POINTER(_POINT), ctypes.POINTER(_SIZE), wt.HDC,
+    ctypes.POINTER(_POINT), wt.COLORREF, ctypes.POINTER(_BLENDFUNCTION), wt.DWORD]
+_user32.UpdateLayeredWindow.restype = wt.BOOL
+_gdi32.CreateCompatibleDC.argtypes, _gdi32.CreateCompatibleDC.restype = [wt.HDC], wt.HDC
+_gdi32.DeleteDC.argtypes,           _gdi32.DeleteDC.restype           = [wt.HDC], wt.BOOL
+_gdi32.CreateDIBSection.argtypes = [wt.HDC, ctypes.POINTER(_BITMAPINFO), wt.UINT,
+                                    ctypes.POINTER(ctypes.c_void_p), wt.HANDLE, wt.DWORD]
+_gdi32.CreateDIBSection.restype = wt.HBITMAP
+_gdi32.SelectObject.argtypes, _gdi32.SelectObject.restype = [wt.HDC, wt.HGDIOBJ], wt.HGDIOBJ
+_gdi32.DeleteObject.argtypes, _gdi32.DeleteObject.restype = [wt.HGDIOBJ], wt.BOOL
+_dwmapi.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+_dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+
+def _is_cloaked(hwnd: int) -> bool:
+    """True for windows hidden by DWM (e.g. living on another virtual desktop)."""
+    cloaked = ctypes.c_int(0)
+    if _dwmapi.DwmGetWindowAttribute(hwnd, _DWMWA_CLOAKED, ctypes.byref(cloaked), 4) != 0:
+        return False
+    return cloaked.value != 0
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -112,7 +169,7 @@ class Config:
                 with open(self.path, "r", encoding="utf-8") as fh:
                     self.data.update(json.load(fh))
             except Exception as exc:
-                print(f"[FocusFrame] Config load error: {exc}")
+                log.error("Config load error: %s", exc)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,20 +185,22 @@ class Config:
 
 # ─── Win32 overlay window ─────────────────────────────────────────────────────
 
-def _wndproc(hwnd, msg, wParam, lParam):
-    """Minimal WndProc — everything deferred to DefWindowProc."""
-    return win32gui.DefWindowProc(hwnd, msg, wParam, lParam)
-
-
 class OverlayWindow:
     """
     A borderless, always-on-top, click-through Win32 layered window.
+
+    Ownership
+    ---------
+    Every Win32 call on the window happens on the thread that called create()
+    (the detector thread).  Other threads only set flags: request_refresh()
+    asks the owner to redraw with the current config on its next tick.
 
     Rendering strategy
     ------------------
     UpdateLayeredWindow() is used instead of GDI paint or tkinter canvas.
     This gives true per-pixel alpha, so the glow can properly fade to
-    transparent without any black-halo artifact.
+    transparent without any black-halo artifact.  The bitmap handed to
+    UpdateLayeredWindow must be premultiplied BGRA, which _blit() takes care of.
 
     Glow direction
     --------------
@@ -152,50 +211,109 @@ class OverlayWindow:
     """
 
     _CLASS = "FocusFrameOverlay"
+    _MAX_ULW_FAILURES = 5
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self._hwnd: int = self._create_window()
+        self._hwnd: int = 0
         self._visible: bool = False
         self._current_rect: tuple | None = None
+        self._class_registered = False
+        self._refresh_requested = False   # set by any thread, consumed by owner
+        self._invalidated = False         # set by the WndProc on system events
+        self._ulw_failures = 0
+        self._ulw_logged = 0
+        self._topmost_fixes = 0
 
-    # ── Window creation ───────────────────────────────────────────────────────
+    # ── Window lifetime (owner thread only) ───────────────────────────────────
 
-    def _create_window(self) -> int:
+    def create(self) -> int:
         hinstance = win32api.GetModuleHandle(None)
 
-        wc = win32gui.WNDCLASS()
-        wc.hInstance     = hinstance
-        wc.lpszClassName = self._CLASS
-        wc.lpfnWndProc   = _wndproc
-        wc.style         = 0
-        wc.hCursor       = 0
-        wc.hbrBackground = 0
-        try:
-            win32gui.RegisterClass(wc)
-        except Exception:
-            pass  # Already registered (e.g. hot-reload)
+        if not self._class_registered:
+            wc = win32gui.WNDCLASS()
+            wc.hInstance     = hinstance
+            wc.lpszClassName = self._CLASS
+            wc.lpfnWndProc   = self._wndproc
+            wc.style         = 0
+            wc.hCursor       = 0
+            wc.hbrBackground = 0
+            try:
+                win32gui.RegisterClass(wc)
+            except Exception:
+                pass  # Already registered (e.g. hot-reload)
+            self._class_registered = True
 
         ex_style = (
-            win32con.WS_EX_LAYERED    |
-            win32con.WS_EX_TRANSPARENT |
-            win32con.WS_EX_TOPMOST    |
-            win32con.WS_EX_TOOLWINDOW |
-            _WS_EX_NOACTIVATE
+            _WS_EX_LAYERED | _WS_EX_TRANSPARENT | _WS_EX_TOPMOST |
+            _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE
         )
-        hwnd = win32gui.CreateWindowEx(
+        self._hwnd = win32gui.CreateWindowEx(
             ex_style, self._CLASS, "",
             win32con.WS_POPUP,
             0, 0, 100, 100,
             None, None, hinstance, None,
         )
-        return hwnd
+        self._visible      = False
+        self._current_rect = None
+        self._ulw_failures = 0
+        try:  # WM_WTSSESSION_CHANGE on lock / unlock
+            ctypes.windll.wtsapi32.WTSRegisterSessionNotification(self._hwnd, 0)
+        except Exception:
+            pass
+        log.info("Overlay window created hwnd=%#x", self._hwnd)
+        return self._hwnd
+
+    def destroy(self) -> None:
+        if self._hwnd and win32gui.IsWindow(self._hwnd):
+            try:
+                ctypes.windll.wtsapi32.WTSUnRegisterSessionNotification(self._hwnd)
+            except Exception:
+                pass
+            try:
+                win32gui.DestroyWindow(self._hwnd)
+            except Exception as exc:
+                log.warning("DestroyWindow failed: %s", exc)
+        self._hwnd = 0
+        self._visible = False
+        self._current_rect = None
+
+    def alive(self) -> bool:
+        return bool(self._hwnd) and bool(win32gui.IsWindow(self._hwnd))
+
+    def _wndproc(self, hwnd, msg, wParam, lParam):
+        if msg == _WM_CLOSE:
+            log.warning("Overlay received WM_CLOSE; ignored")
+            return 0
+        if msg == _WM_DESTROY:
+            if hwnd == self._hwnd:
+                log.warning("Overlay window %#x destroyed; it will be recreated", hwnd)
+                self._hwnd = 0
+                self._visible = False
+                self._current_rect = None
+            return 0
+        if msg in (_WM_DISPLAYCHANGE, _WM_SETTINGCHANGE, _WM_POWERBROADCAST,
+                   _WM_WTSSESSION_CHANGE, _WM_DPICHANGED):
+            # Display, DPI, power or lock/unlock change: redraw from scratch.
+            self._invalidated = True
+        return win32gui.DefWindowProc(hwnd, msg, wParam, lParam)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     @property
     def hwnd(self) -> int:
         return self._hwnd
+
+    def request_refresh(self) -> None:
+        """Thread-safe: ask the owner thread to redraw with the current config."""
+        self._refresh_requested = True
+
+    def service(self) -> None:
+        """Owner thread: apply pending refresh / invalidation requests."""
+        if self._refresh_requested or self._invalidated:
+            self._refresh_requested = False
+            self._invalidated = False
+            self.refresh()
 
     def update_border(self, rect: tuple) -> None:
         """
@@ -227,9 +345,48 @@ class OverlayWindow:
 
     def hide(self) -> None:
         self._current_rect = None
-        if self._visible:
+        if self._visible and self._hwnd:
             win32gui.ShowWindow(self._hwnd, win32con.SW_HIDE)
-            self._visible = False
+        self._visible = False
+
+    def ensure_topmost(self) -> bool:
+        """
+        Put the overlay back on top if a normal (non-topmost) window has been
+        placed above it.  Windows does this for shell-activated windows without
+        clearing WS_EX_TOPMOST, so the style bit alone cannot be trusted.
+        Returns True when a fix was applied.
+        """
+        if not self._visible or not self._hwnd or not self._is_demoted():
+            return False
+        try:
+            win32gui.SetWindowPos(
+                self._hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE,
+            )
+        except Exception as exc:
+            log.warning("SetWindowPos(HWND_TOPMOST) failed: %s", exc)
+            return False
+        self._topmost_fixes += 1
+        if self._topmost_fixes <= 10 or self._topmost_fixes % 100 == 0:
+            log.info("Overlay was below a normal window; re-asserted HWND_TOPMOST (%d so far)",
+                     self._topmost_fixes)
+        return True
+
+    def _is_demoted(self) -> bool:
+        """True if any visible, un-cloaked, non-topmost window sits above us."""
+        cur = win32gui.GetWindow(self._hwnd, win32con.GW_HWNDPREV)
+        hops = 0
+        while cur and hops < 512:
+            try:
+                if (win32gui.IsWindowVisible(cur)
+                        and not (win32gui.GetWindowLong(cur, win32con.GWL_EXSTYLE) & _WS_EX_TOPMOST)
+                        and not _is_cloaked(cur)):
+                    return True
+            except Exception:
+                pass
+            cur = win32gui.GetWindow(cur, win32con.GW_HWNDPREV)
+            hops += 1
+        return False
 
     # ── Rendering (PIL → DIB → UpdateLayeredWindow) ───────────────────────────
 
@@ -305,73 +462,113 @@ class OverlayWindow:
         Push the RGBA image to the layered window via UpdateLayeredWindow.
         This replaces the entire window content (position + pixels) atomically.
         """
-        # PIL stores RGBA; Windows DIB expects BGRA
+        if not self._hwnd:
+            return
+
+        # PIL stores straight RGBA; UpdateLayeredWindow wants PREMULTIPLIED BGRA.
+        # Without premultiplication every translucent pixel is rendered far too
+        # bright (a 10 % gray line shows up as a near-white line).
         r_ch, g_ch, b_ch, a_ch = img.split()
-        bgra_img = Image.merge("RGBA", (b_ch, g_ch, r_ch, a_ch))
-        raw      = bgra_img.tobytes()
+        bgra_img = Image.merge("RGBA", (
+            ImageChops.multiply(b_ch, a_ch),
+            ImageChops.multiply(g_ch, a_ch),
+            ImageChops.multiply(r_ch, a_ch),
+            a_ch,
+        ))
+        raw = bgra_img.tobytes()
 
-        hdc_screen = ctypes.windll.user32.GetDC(None)
-        hdc_mem    = ctypes.windll.gdi32.CreateCompatibleDC(hdc_screen)
+        hdc_screen = hdc_mem = hbm = None
+        old_bm = None
+        try:
+            hdc_screen = _user32.GetDC(None)
+            hdc_mem    = _gdi32.CreateCompatibleDC(hdc_screen)
+            if not hdc_screen or not hdc_mem:
+                raise OSError(f"GetDC/CreateCompatibleDC failed, error {ctypes.get_last_error()}")
 
-        bmi = _BITMAPINFO()
-        bmi.bmiHeader.biSize      = ctypes.sizeof(_BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth     = w
-        bmi.bmiHeader.biHeight    = -h   # negative → top-down DIB
-        bmi.bmiHeader.biPlanes    = 1
-        bmi.bmiHeader.biBitCount  = 32
-        bmi.bmiHeader.biCompression = 0  # BI_RGB
+            bmi = _BITMAPINFO()
+            bmi.bmiHeader.biSize        = ctypes.sizeof(_BITMAPINFOHEADER)
+            bmi.bmiHeader.biWidth       = w
+            bmi.bmiHeader.biHeight      = -h   # negative → top-down DIB
+            bmi.bmiHeader.biPlanes      = 1
+            bmi.bmiHeader.biBitCount    = 32
+            bmi.bmiHeader.biCompression = 0    # BI_RGB
 
-        pbits = ctypes.c_void_p()
-        hbm   = ctypes.windll.gdi32.CreateDIBSection(
-            hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(pbits), None, 0
-        )
-        ctypes.memmove(pbits, raw, len(raw))
-        old_bm = ctypes.windll.gdi32.SelectObject(hdc_mem, hbm)
+            pbits = ctypes.c_void_p()
+            hbm = _gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0,
+                                          ctypes.byref(pbits), None, 0)
+            if not hbm or not pbits.value:
+                raise OSError(f"CreateDIBSection({w}x{h}) failed, error {ctypes.get_last_error()}")
+            ctypes.memmove(pbits, raw, len(raw))
+            old_bm = _gdi32.SelectObject(hdc_mem, hbm)
 
-        pt_dst = _POINT(dst_x, dst_y)
-        pt_src = _POINT(0, 0)
-        sz     = _SIZE(w, h)
-        bf     = _BLENDFUNCTION(_AC_SRC_OVER, 0, 255, _AC_SRC_ALPHA)
+            pt_dst = _POINT(dst_x, dst_y)
+            pt_src = _POINT(0, 0)
+            sz     = _SIZE(w, h)
+            bf     = _BLENDFUNCTION(_AC_SRC_OVER, 0, 255, _AC_SRC_ALPHA)
 
-        # Show the window (no-op if already visible, never steals focus)
-        if not self._visible:
-            win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWNOACTIVATE)
-            self._visible = True
+            # Show the window (never steals focus) and make sure it is at the
+            # top of the topmost band at the same time.
+            if not self._visible:
+                win32gui.SetWindowPos(
+                    self._hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
+                    win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW,
+                )
+                self._visible = True
 
-        ctypes.windll.user32.UpdateLayeredWindow(
-            self._hwnd,
-            hdc_screen,
-            ctypes.byref(pt_dst),
-            ctypes.byref(sz),
-            hdc_mem,
-            ctypes.byref(pt_src),
-            0,
-            ctypes.byref(bf),
-            _ULW_ALPHA,
-        )
+            ok = _user32.UpdateLayeredWindow(
+                self._hwnd, hdc_screen,
+                ctypes.byref(pt_dst), ctypes.byref(sz),
+                hdc_mem, ctypes.byref(pt_src),
+                0, ctypes.byref(bf), _ULW_ALPHA,
+            )
+            if not ok:
+                self._on_ulw_failure(ctypes.get_last_error(), w, h)
+            else:
+                self._ulw_failures = 0
+        finally:
+            # Clean up GDI objects whatever happened above
+            if hdc_mem and old_bm is not None:
+                _gdi32.SelectObject(hdc_mem, old_bm)
+            if hbm:
+                _gdi32.DeleteObject(hbm)
+            if hdc_mem:
+                _gdi32.DeleteDC(hdc_mem)
+            if hdc_screen:
+                _user32.ReleaseDC(None, hdc_screen)
 
-        # Clean up GDI objects
-        ctypes.windll.gdi32.SelectObject(hdc_mem, old_bm)
-        ctypes.windll.gdi32.DeleteObject(hbm)
-        ctypes.windll.gdi32.DeleteDC(hdc_mem)
-        ctypes.windll.user32.ReleaseDC(None, hdc_screen)
+    def _on_ulw_failure(self, err: int, w: int, h: int) -> None:
+        self._ulw_failures += 1
+        self._ulw_logged += 1
+        if self._ulw_logged <= 10 or self._ulw_logged % 100 == 0:
+            log.error("UpdateLayeredWindow failed (error %d, %dx%d, %d consecutive)",
+                      err, w, h, self._ulw_failures)
+        self._current_rect = None               # retry on the next tick
+        if self._ulw_failures >= self._MAX_ULW_FAILURES:
+            log.error("Recreating overlay window after repeated UpdateLayeredWindow failures")
+            self.destroy()
 
 
 # ─── Focus Detector ───────────────────────────────────────────────────────────
 
 class FocusDetector:
     """
-    Polls GetForegroundWindow() and GetWindowRect() in a background thread.
+    Owns the overlay window.  Polls GetForegroundWindow() and GetWindowRect()
+    in a background thread and keeps the overlay healthy.
 
     The overlay is updated whenever:
       - The focused window changes (different HWND), OR
       - The focused window is moved / resized (same HWND, different rect).
 
-    Both conditions are checked every refresh_rate_ms milliseconds, which is
-    what makes the overlay follow windows smoothly as they are dragged.
+    Housekeeping on every tick / every second:
+      - Win32 messages for the overlay are pumped (this thread owns it).
+      - Pending refresh requests from the settings UI are applied.
+      - A destroyed overlay window is recreated.
+      - If a normal window got above the overlay, HWND_TOPMOST is re-asserted.
     """
 
     _ALWAYS_EXCLUDE = {"Shell_TrayWnd", "Progman", "WorkerW"}
+    _TOPMOST_CHECK_INTERVAL = 1.0   # seconds
 
     def __init__(self, config: Config, overlay: OverlayWindow,
                  stop_event: threading.Event) -> None:
@@ -380,15 +577,46 @@ class FocusDetector:
         self.stop_event = stop_event
         self._last_hwnd: int | None   = None
         self._last_rect: tuple | None = None
+        self._errors = 0
 
     def run(self) -> None:
         """Daemon thread entry point."""
+        try:
+            self.overlay.create()
+        except Exception:
+            log.exception("Could not create the overlay window")
+            return
+        next_topmost_check = 0.0
+
         while not self.stop_event.is_set():
             try:
+                win32gui.PumpWaitingMessages()
+
+                if not self.overlay.alive():
+                    log.warning("Overlay window is gone; recreating it")
+                    self.overlay.create()
+                    self._last_hwnd = None
+                    self._last_rect = None
+
+                self.overlay.service()
                 self._tick()
-            except Exception as exc:
-                print(f"[FocusFrame] Detector: {exc}")
-            self.stop_event.wait(self.config["refresh_rate_ms"] / 1000.0)
+
+                now = time.monotonic()
+                if now >= next_topmost_check:
+                    next_topmost_check = now + self._TOPMOST_CHECK_INTERVAL
+                    self.overlay.ensure_topmost()
+            except Exception:
+                self._errors += 1
+                if self._errors <= 10 or self._errors % 100 == 0:
+                    log.exception("Detector error #%d", self._errors)
+
+            try:
+                delay = max(1, int(self.config["refresh_rate_ms"])) / 1000.0
+            except (TypeError, ValueError):
+                delay = 0.05
+            self.stop_event.wait(delay)
+
+        self.overlay.destroy()
 
     def _tick(self) -> None:
         hwnd = win32gui.GetForegroundWindow()
@@ -403,16 +631,26 @@ class FocusDetector:
         try:
             rect = win32gui.GetWindowRect(hwnd)
         except Exception:
+            self._last_hwnd = None
+            self._last_rect = None
             self.overlay.hide()
             return
 
+        window_changed = hwnd != self._last_hwnd
+
         # Skip if nothing changed — avoids unnecessary redraws
-        if hwnd == self._last_hwnd and rect == self._last_rect:
+        if not window_changed and rect == self._last_rect:
             return
 
         self._last_hwnd = hwnd
         self._last_rect = rect
         self.overlay.update_border(rect)
+
+        # A newly activated window is the typical moment Windows slips a normal
+        # window above the topmost band — check right away instead of waiting
+        # for the periodic check.
+        if window_changed:
+            self.overlay.ensure_topmost()
 
     def _should_skip(self, hwnd: int) -> bool:
         if not hwnd:
@@ -583,7 +821,7 @@ class SettingsWindow:
             self._apply()
 
     def _apply(self) -> None:
-        """Push current UI values into config and refresh the overlay live."""
+        """Push current UI values into config and ask the overlay to redraw."""
         self.config["border_color"]     = self._color.get()
         self.config["border_thickness"] = self._thickness.get()
         self.config["glow_enabled"]     = self._glow_on.get()
@@ -592,7 +830,7 @@ class SettingsWindow:
         self.config["corner_radius"]    = self._corner.get()
         self.config["border_inset"]     = self._inset.get()
         self.config["refresh_rate_ms"]  = self._refresh.get()
-        self.overlay.refresh()
+        self.overlay.request_refresh()   # redraw happens on the overlay's own thread
 
     def _save(self) -> None:
         self._apply()
@@ -648,7 +886,7 @@ class TrayIcon:
                     pass
             winreg.CloseKey(key)
         except Exception as exc:
-            print(f"[FocusFrame] Autostart: {exc}")
+            log.error("Autostart: %s", exc)
 
     # ── Menu callbacks ─────────────────────────────────────────────────────────
 
@@ -663,6 +901,7 @@ class TrayIcon:
         self._set_autostart(new)
 
     def _on_quit(self, icon, item) -> None:
+        log.info("Quit requested from tray")
         self.stop_event.set()
         icon.stop()
         self.root.after(0, self.root.quit)
@@ -687,13 +926,47 @@ class TrayIcon:
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
-def _locate_config() -> Path:
+def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / "config" / "config.json"
-    return Path(__file__).resolve().parent.parent / "config" / "config.json"
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _locate_config() -> Path:
+    """config/config.json next to the project or executable; --config PATH overrides."""
+    if "--config" in sys.argv:
+        return Path(sys.argv[sys.argv.index("--config") + 1]).resolve()
+    return _base_dir() / "config" / "config.json"
+
+
+def _setup_logging() -> None:
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(threadName)s: %(message)s")
+    log.setLevel(logging.INFO)
+    candidates = [
+        _base_dir(),
+        Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "FocusFrame",
+    ]
+    for directory in candidates:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                directory / "focusframe.log", maxBytes=1_000_000,
+                backupCount=2, encoding="utf-8")
+            handler.setFormatter(fmt)
+            log.addHandler(handler)
+            break
+        except OSError:
+            continue
+    if sys.stderr is not None:          # None under pythonw.exe
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(fmt)
+        log.addHandler(stream)
 
 
 def main() -> None:
+    _setup_logging()
+    log.info("FocusFrame starting (pid %d, python %s)", os.getpid(), sys.version.split()[0])
+
     # Enable per-monitor DPI awareness before any window is created
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -706,10 +979,11 @@ def main() -> None:
     config     = Config(str(_locate_config()))
     stop_event = threading.Event()
 
-    # Overlay is a pure Win32 window (no tkinter involved in its rendering)
+    # The overlay is a pure Win32 window; it is created and driven entirely on
+    # the detector thread (see FocusDetector.run), never from tkinter's thread.
     overlay = OverlayWindow(config)
 
-    # Hidden tkinter root — only used for the Settings Toplevel + message pump
+    # Hidden tkinter root — only used for the Settings Toplevel
     root = tk.Tk()
     root.withdraw()
 
@@ -717,18 +991,12 @@ def main() -> None:
     tray     = TrayIcon(config, overlay, settings, stop_event, root)
     detector = FocusDetector(config, overlay, stop_event)
 
-    # Pump Win32 messages for the overlay window from the tkinter event loop
-    def _pump():
-        win32gui.PumpWaitingMessages()
-        if not stop_event.is_set():
-            root.after(32, _pump)
-
-    root.after(32, _pump)
-
     threading.Thread(target=detector.run, daemon=True, name="Detector").start()
     threading.Thread(target=tray.run,     daemon=True, name="TrayIcon").start()
 
     root.mainloop()
+    stop_event.set()
+    log.info("FocusFrame exiting")
 
 
 if __name__ == "__main__":

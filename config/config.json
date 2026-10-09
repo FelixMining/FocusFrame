@@ -1,11 +1,12 @@
 {
-  "border_color": "#0078D4",
+  "border_color": "#8E8E93",
   "border_thickness": 2,
   "glow_enabled": true,
-  "glow_radius": 8,
-  "opacity": 0.9,
-  "corner_radius": 0,
-  "refresh_rate_ms": 50,
+  "glow_radius": 4,
+  "opacity": 1.0,
+  "corner_radius": 8,
+  "border_inset": 0,
+  "refresh_rate_ms": 1,
   "autostart": true,
   "excluded_classes": [
     "Shell_TrayWnd",
