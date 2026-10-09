@@ -181,26 +181,34 @@ FocusFrame/
 ## How it works
 
 1. **Focus detection** — A background thread polls `GetForegroundWindow()` every
-   `refresh_rate_ms` milliseconds.  When the returned handle changes, it reads
-   the new window's position with `GetWindowRect()`.
+   `refresh_rate_ms` milliseconds.  When the handle or the window rectangle
+   changes, it reads the new position with `GetWindowRect()` and redraws.
 
-2. **Overlay window** — A borderless tkinter window is kept always-on-top.  Its
-   background color is set as a chroma-key (`-transparentcolor black`), making
-   every black pixel fully transparent at the OS level.  The border and glow are
-   drawn on a canvas; everything else remains transparent.
+2. **Overlay window** — A borderless Win32 layered window (`WS_EX_LAYERED`)
+   owned by the detector thread.  The border and glow are rendered with Pillow
+   into a premultiplied BGRA bitmap and pushed with `UpdateLayeredWindow()`,
+   which gives true per-pixel alpha: everything outside the border is fully
+   transparent and the glow fades smoothly into the window below.
 
 3. **Click-through** — Win32 extended styles `WS_EX_TRANSPARENT` and
    `WS_EX_NOACTIVATE` ensure that the overlay window neither captures mouse
    events nor steals keyboard focus.
 
-4. **Glow effect** — Concentric rectangles are drawn expanding outward from the
-   border, each colored by interpolating the border color toward black.  As the
-   color approaches black it blends into the transparent background, creating a
-   soft fade-out halo.
+4. **Self-healing** — Windows sometimes places a window that was activated
+   through the shell (for example a file opened from Explorer) above every
+   always-on-top window without clearing their `WS_EX_TOPMOST` style.  The
+   detector checks on every focus change and once per second whether a normal
+   window sits above the overlay and, if so, re-asserts `HWND_TOPMOST`.  A
+   destroyed overlay window is recreated, and display, DPI, power and
+   lock/unlock events force a full redraw.
 
-5. **Thread safety** — All tkinter calls from the detector thread are marshalled
-   to the main thread via `root.after(0, callback)`, the only thread-safe way
-   to interact with tkinter.
+5. **Thread safety** — All Win32 calls on the overlay happen on the thread that
+   created it.  The settings window (tkinter, main thread) only sets a refresh
+   flag that the detector thread picks up; tray callbacks reach tkinter via
+   `root.after(0, callback)`.
+
+6. **Logging** — Problems are written to `focusframe.log` next to the project
+   (or in `%LOCALAPPDATA%\FocusFrame` when that folder is read-only).
 
 ---
 
